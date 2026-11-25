@@ -1,0 +1,169 @@
+name: Blast Guardrail Scan
+description: Deterministic diff forensics for agent-written changes — no model, no network.
+author: Shrikant Jadhav
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  base:
+    description: "Git ref to diff against. Use origin/<base-branch> with fetch-depth: 0."
+    required: false
+    default: origin/main
+  policy:
+    description: Path to a blast.toml policy file.
+    required: false
+    default: ""
+  max-risk:
+    description: Highest acceptable risk score. Leave empty to use the policy/default.
+    required: false
+    default: ""
+  max-files:
+    description: Most files allowed in one change. Leave empty to use the policy/default.
+    required: false
+    default: ""
+  fail-on:
+    description: Minimum severity that fails the gate (info, low, medium, high, critical).
+    required: false
+    default: ""
+  require-tests:
+    description: Override require-tests with "true" or "false". Leave empty to use the policy/default.
+    required: false
+    default: ""
+  deny:
+    description: Comma- or newline-separated path globs to deny; appended to the policy deny list.
+    required: false
+    default: ""
+  version:
+    description: Go version query for the Blast CLI, e.g. latest, v0.1.0, or a commit SHA.
+    required: false
+    default: latest
+  advisory:
+    description: Report findings and annotations, but do not fail the job.
+    required: false
+    default: "false"
+
+outputs:
+  score:
+    description: Risk score from 0 to 100.
+    value: ${{ steps.scan.outputs.score }}
+  verdict:
+    description: Blast verdict — low, moderate, elevated, or severe.
+    value: ${{ steps.scan.outputs.verdict }}
+  findings:
+    description: Number of findings.
+    value: ${{ steps.scan.outputs.findings }}
+  policy:
+    description: Policy result — pass or fail.
+    value: ${{ steps.gate.outputs.policy }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.23"
+        cache: false
+
+    - name: Install Blast
+      shell: bash
+      env:
+        BLAST_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        export GOBIN="$RUNNER_TEMP/blast-bin"
+        mkdir -p "$GOBIN"
+        go install "github.com/ShrikantJadhav/blast/cmd/blast@${BLAST_VERSION}"
+        echo "$GOBIN" >> "$GITHUB_PATH"
+
+    - name: Scan diff and emit annotations
+      id: scan
+      shell: bash
+      timeout-minutes: 10
+      env:
+        BASE: ${{ inputs.base }}
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/blast-scan.json"
+        if ! blast scan --json --no-color --base "$BASE" > "$out"; then
+          echo "::error::blast scan failed"
+          exit 2
+        fi
+        python3 "$GITHUB_ACTION_PATH/scripts/annotate.py" "$out"
+
+    - name: Enforce policy
+      id: gate
+      shell: bash
+      timeout-minutes: 10
+      env:
+        BASE: ${{ inputs.base }}
+        POLICY: ${{ inputs.policy }}
+        MAX_RISK: ${{ inputs.max-risk }}
+        MAX_FILES: ${{ inputs.max-files }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        REQUIRE_TESTS: ${{ inputs.require-tests }}
+        DENY: ${{ inputs.deny }}
+        ADVISORY: ${{ inputs.advisory }}
+      run: |
+        set -euo pipefail
+
+        args=(check --no-color --base "$BASE")
+        if [[ -n "${POLICY:-}" ]]; then args+=(--policy "$POLICY"); fi
+        if [[ -n "${MAX_RISK:-}" ]]; then args+=(--max-risk "$MAX_RISK"); fi
+        if [[ -n "${MAX_FILES:-}" ]]; then args+=(--max-files "$MAX_FILES"); fi
+        if [[ -n "${FAIL_ON:-}" ]]; then args+=(--fail-on "$FAIL_ON"); fi
+        if [[ -n "${REQUIRE_TESTS:-}" ]]; then args+=(--require-tests="$REQUIRE_TESTS"); fi
+
+        if [[ -n "${DENY:-}" ]]; then
+          while IFS= read -r pattern; do
+            pattern="$(printf '%s' "$pattern" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+            if [[ -n "$pattern" ]]; then args+=(--deny "$pattern"); fi
+          done < <(printf '%s' "$DENY" | tr ',' '\n')
+        fi
+
+        advisory=false
+        advisory_value="$(printf '%s' "${ADVISORY:-}" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$advisory_value" == "true" ]]; then advisory=true; fi
+
+        log="$RUNNER_TEMP/blast-check.txt"
+        set +e
+        blast "${args[@]}" > "$log" 2>&1
+        rc=$?
+        set -e
+        cat "$log"
+
+        if [[ "$rc" -eq 0 ]]; then
+          result=pass
+        elif [[ "$rc" -eq 1 ]]; then
+          result=fail
+        else
+          echo "::error::blast check failed with exit code $rc"
+          exit "$rc"
+        fi
+
+        echo "policy=$result" >> "$GITHUB_OUTPUT"
+
+        {
+          echo
+          echo "### Blast policy"
+          if [[ "$result" == "pass" ]]; then
+            echo
+            echo "✅ pass"
+          else
+            echo
+            echo "❌ fail"
+            echo
+            echo '<pre>'
+            sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$log"
+            echo '</pre>'
+          fi
+          if [[ "$advisory" == "true" && "$result" == "fail" ]]; then
+            echo
+            echo "> Advisory mode: the job will not fail for this policy result."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [[ "$result" == "fail" && "$advisory" != "true" ]]; then
+          exit 1
+        fi

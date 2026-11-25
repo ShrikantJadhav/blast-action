@@ -1,0 +1,36 @@
+# Copy to .github/workflows/blast.yml in the target repo.
+name: Blast guardrails
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  blast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Shadow mode: remove `advisory: "true"` once the policy is tuned, then
+      # make the "Blast guardrails / blast" check required in branch protection.
+      - uses: ShrikantJadhav/blast-action@v1
+        id: blast
+        with:
+          base: origin/${{ github.event.pull_request.base.ref }}
+          advisory: "true"
+          # policy: blast.toml
+          # deny: |
+          #   infra/**
+          #   **/*.pem
+
+      - name: Report
+        if: always()
+        run: |
+          echo "verdict=${{ steps.blast.outputs.verdict }}"
+          echo "score=${{ steps.blast.outputs.score }}"
+          echo "findings=${{ steps.blast.outputs.findings }}"
+          echo "policy=${{ steps.blast.outputs.policy }}"
